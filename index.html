@@ -3,25 +3,22 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
-<title>KidCam</title><!-- v2.0 -->
+<title>KidCam</title><!-- v3.0 puppet -->
 <style>
   html,body{margin:0;height:100%;background:#eef3f8;color:#1a2330;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;overflow:hidden}
-  #stage{position:fixed;inset:0;width:100%;height:100%;display:block;touch-action:none;background:#eef3f8}
+  #stage{position:fixed;inset:0;width:100%;height:100%;display:block;touch-action:none}
   #video{display:none}
-  .pill{position:fixed;top:10px;left:10px;right:10px;text-align:center;pointer-events:none}
-  .pill span{display:inline-block;background:rgba(255,255,255,.92);padding:8px 14px;border-radius:20px;font-size:15px;border:1px solid #d7dee6;max-width:90%}
+  .pill{position:fixed;top:10px;left:10px;right:10px;text-align:center;pointer-events:none;z-index:2}
+  .pill span{display:inline-block;background:rgba(255,255,255,.9);padding:7px 14px;border-radius:20px;font-size:14px;border:1px solid #d7dee6}
   #bar{position:fixed;left:0;right:0;bottom:0;display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:10px;
-       background:rgba(255,255,255,.94);border-top:1px solid #d7dee6;font-size:14px;z-index:3}
+       background:rgba(255,255,255,.94);border-top:1px solid #d7dee6;font-size:14px;z-index:3;transition:transform .25s}
+  #bar.hidden{transform:translateY(105%)}
   button,select{font:inherit;padding:9px 13px;border-radius:10px;border:1px solid #c5ced9;background:#fff;color:#1a2330;cursor:pointer}
   button.primary{background:#1f6feb;border-color:#1f6feb;color:#fff}
-  .veh{font-size:26px;padding:4px 8px;line-height:1}
-  .veh.on{background:#dfe9ff;border-color:#1f6feb}
-  label{display:flex;align-items:center;gap:4px}
-  #cam{position:fixed;inset:0;display:none;z-index:4;pointer-events:none}
-  #cam button{pointer-events:auto}
-  #shutter{position:absolute;left:50%;bottom:28px;transform:translateX(-50%);width:78px;height:78px;border-radius:50%;background:#fff;border:6px solid rgba(255,255,255,.5);box-shadow:0 2px 12px rgba(0,0,0,.4);padding:0}
-  #cancel{position:absolute;right:14px;top:14px;width:44px;height:44px;border-radius:50%;background:rgba(255,255,255,.9);font-size:20px;padding:0}
-  #retry{position:absolute;left:14px;bottom:40px;display:none}
+  button.on{background:#dfe9ff;border-color:#1f6feb}
+  .chr{font-size:22px;padding:5px 10px;line-height:1}
+  label{display:flex;align-items:center;gap:5px}
+  #peek{position:fixed;right:12px;bottom:12px;width:44px;height:44px;border-radius:50%;background:rgba(255,255,255,.8);border:1px solid #c5ced9;font-size:19px;display:none;z-index:3}
   #err{position:fixed;inset:0;background:rgba(238,243,248,.97);display:none;align-items:center;justify-content:center;padding:20px;z-index:6}
   #err .card{max-width:520px;background:#fff;border:1px solid #f0b5a8;border-radius:14px;padding:22px;font-size:16px;line-height:1.5}
 </style>
@@ -29,269 +26,329 @@
 <body>
 <video id="video" playsinline muted autoplay></video>
 <canvas id="stage"></canvas>
-<div class="pill"><span id="status">Loading…</span></div>
-
-<div id="cam">
-  <button id="cancel">✕</button>
-  <button id="retry" class="primary">Retake</button>
-  <button id="shutter" title="Take photo"></button>
-</div>
-
+<div class="pill"><span id="status">Loading the body-tracking model…</span></div>
+<button id="peek" title="Controls">⚙</button>
 <div id="err"><div class="card"><div id="errText"></div><p><button id="errOk" class="primary">Try again</button></p></div></div>
 
 <div id="bar">
-  <button id="photo" class="primary">📷 Take photo</button>
-  <button id="live">🎥 Live</button>
-  <span id="vehicles"></span>
-  <label>Crop <select id="crop"><option value="head" selected>Head</option><option value="shoulders">Shoulders</option><option value="waist">Waist</option></select></label>
-  <label>Scene <select id="scene"><option value="road" selected>Road</option><option value="sky">Sky</option><option value="space">Space</option></select></label>
-  <label>Size <input id="vsize" type="range" min="0.3" max="0.9" step="0.01" value="0.6"></label>
+  <button id="start" class="primary" disabled>Loading…</button>
+  <span id="chars"></span>
+  <button id="faceBtn" class="on">🙂 Face on</button>
+  <label>Scene <select id="scene">
+    <option value="snow" selected>Snow</option><option value="road">Road</option>
+    <option value="sky">Sky</option><option value="space">Space</option><option value="plain">Plain</option>
+  </select></label>
+  <button id="reset">Re-centre</button>
   <button id="fs">Fullscreen</button>
+  <button id="hide">Hide</button>
 </div>
 
 <script type="module">
-import { FilesetResolver, ImageSegmenter, FaceDetector } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+import { FilesetResolver, PoseLandmarker } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
 
 const $ = id => document.getElementById(id);
 const video=$('video'), stage=$('stage'), ctx=stage.getContext('2d'), statusEl=$('status');
-const src = document.createElement('canvas'), sctx = src.getContext('2d');   // mirrored camera frame (what models see)
-const cut = document.createElement('canvas'), cctx = cut.getContext('2d');   // live-mode person cutout
-const maskC = document.createElement('canvas'), mctx = maskC.getContext('2d');
+const src=document.createElement('canvas'), sctx=src.getContext('2d');       // mirrored camera frame
+const fc=document.createElement('canvas'), fctx=fc.getContext('2d');         // face crop
+const fm=document.createElement('canvas'), fmx=fm.getContext('2d');          // face feather mask
 
-const VEHICLES = [
-  {e:'🚗',seat:0.42,kid:0.5}, {e:'🚌',seat:0.35,kid:0.45}, {e:'🚂',seat:0.38,kid:0.42}, {e:'✈️',seat:0.42,kid:0.4},
-  {e:'🚀',seat:0.38,kid:0.42}, {e:'🚁',seat:0.55,kid:0.4}, {e:'🚤',seat:0.40,kid:0.45}, {e:'🦖',seat:0.25,kid:0.45}, {e:'🎈',seat:1.05,kid:0.45},
-];
-const CROPS = { head:{up:0.9,down:1.6,side:1.2}, shoulders:{up:0.9,down:2.3,side:1.7}, waist:{up:0.9,down:3.4,side:1.9} };
-let vehicle=VEHICLES[0], cropName='head', scene='road', vsizeF=0.6;
-let mode='idle';            // idle | camera | pick | live
-let sticker=null;           // {c:canvas, faceBottom, faceCx}
-let faces=[], fit={s:1,ox:0,oy:0};
-let segmenter, detector, camOn=false, invert=false, invertChecked=false;
-// live mode state
-let lock=null, vx=null, vy=null, drag=null, held=null, maskCoverage=0;
+// ---------- characters ----------
+const CHARS = {
+  yeti:{ icon:'🦍', main:'#f4f8fc', shade:'#cddff0', line:'#9dbdd8', trim:'#a9c9e2', edge:'fluff',
+         skin:'#eaf3fb', nose:'#4a6b85', build:1.0 },
+  dino:{ icon:'🦖', main:'#7fd08c', shade:'#54a864', line:'#2f7a41', trim:'#f4c542', edge:'spike',
+         skin:'#a7e2b0', nose:'#2f6b3a', build:1.05 },
+  robot:{ icon:'🤖', main:'#cfd8e2', shade:'#9fb0c1', line:'#6f8296', trim:'#4aa3ff', edge:'bolt',
+         skin:'#e6edf4', nose:'#3c5568', build:0.95 },
+};
+let charName='yeti';
+const C = () => CHARS[charName];
 
-// ---------- UI ----------
-const vehWrap=$('vehicles');
-VEHICLES.forEach((v,i)=>{ const b=document.createElement('button'); b.className='veh'+(i===0?' on':''); b.textContent=v.e;
-  b.onclick=()=>{ vehicle=v; [...vehWrap.children].forEach(c=>c.classList.remove('on')); b.classList.add('on'); }; vehWrap.appendChild(b); });
-$('crop').onchange=e=>{ cropName=e.target.value; if(lastShot) buildSticker(lastShot.face); };
+// ---------- state ----------
+let landmarker=null, camOn=false, running=false;
+let lm=null, lastSeen=0, faceOn=true, scene='snow';
+let view={z:1, px:0, py:0};
+let fit={s:1,ox:0,oy:0};
+let lastTs=0;
+
+// ---------- ui ----------
+const charWrap=$('chars');
+Object.entries(CHARS).forEach(([k,v],i)=>{ const b=document.createElement('button');
+  b.className='chr'+(i===0?' on':''); b.textContent=v.icon; b.title=k;
+  b.onclick=()=>{ charName=k; [...charWrap.children].forEach(c=>c.classList.remove('on')); b.classList.add('on'); touchBar(); };
+  charWrap.appendChild(b); });
+$('faceBtn').onclick=()=>{ faceOn=!faceOn; $('faceBtn').classList.toggle('on',faceOn); $('faceBtn').textContent=faceOn?'🙂 Face on':'🙂 Face off'; touchBar(); };
 $('scene').onchange=e=>scene=e.target.value;
-$('vsize').oninput=e=>vsizeF=+e.target.value;
+$('reset').onclick=()=>{ view={z:1,px:0,py:0}; touchBar(); };
 $('fs').onclick=()=>document.documentElement.requestFullscreen?.().catch(()=>{});
-$('photo').onclick=()=>openCamera();
-$('live').onclick=()=>startLive();
-$('cancel').onclick=()=>{ setMode('idle'); };
-$('shutter').onclick=()=>takePhoto();
-$('retry').onclick=()=>{ lastShot=null; setMode('camera'); };
-$('errOk').onclick=()=>{ $('err').style.display='none'; openCamera(); };
-
-function setMode(m){
-  mode=m;
-  $('cam').style.display = (m==='camera'||m==='pick') ? 'block' : 'none';
-  $('shutter').style.display = m==='camera' ? 'block' : 'none';
-  $('retry').style.display = m==='pick' ? 'block' : 'none';
-  $('bar').style.display = (m==='camera'||m==='pick') ? 'none' : 'flex';
-  $('live').textContent = m==='live' ? '⏹ Stop live' : '🎥 Live';
-  if(m!=='live'){ lock=null; vx=vy=null; held=null; drag=null; }
-}
+$('hide').onclick=hideBar; $('peek').onclick=showBar;
+$('start').onclick=()=>start();
+$('errOk').onclick=()=>{ $('err').style.display='none'; start(); };
+let barTimer;
+function hideBar(){ $('bar').classList.add('hidden'); $('peek').style.display='block'; }
+function showBar(){ $('bar').classList.remove('hidden'); $('peek').style.display='none'; touchBar(); }
+function touchBar(){ clearTimeout(barTimer); if(running) barTimer=setTimeout(hideBar,7000); }
+$('bar').addEventListener('pointerdown',touchBar);
 
 // ---------- camera ----------
 function camError(e){
   let why;
-  if(!window.isSecureContext) why=`Not HTTPS (${location.protocol}//) — browser refuses the camera. Open <b>https://frinoahds.github.io/kidcam/</b>.`;
-  else if(/denied|permission/i.test(e.message||e.name)) why=`<b>Camera is blocked for this site.</b><br>Tap the icon left of the address → Permissions → Camera → Allow → reload.<br>Still blocked: Chrome ⋮ → Settings → Site settings → Camera → this site → Allow. Android Settings → Apps → Chrome → Permissions → Camera on.`;
+  if(!window.isSecureContext) why=`Page isn't on HTTPS (${location.protocol}//) so the browser refuses the camera. Open <b>https://frinoahds.github.io/kidcam/</b>.`;
+  else if(/denied|permission/i.test(e.message||e.name)) why=`<b>Camera is blocked for this site.</b><br>Tap the icon left of the address → Permissions → Camera → Allow → reload.<br>Still stuck: Chrome ⋮ → Settings → Site settings → Camera → this site → Allow; and Android Settings → Apps → Chrome → Permissions → Camera on.`;
   else why=`Camera error: ${e.name} — ${e.message}`;
   $('errText').innerHTML=why; $('err').style.display='flex';
 }
-async function ensureCam(){
-  if(camOn) return true;
+async function start(){
+  if(!landmarker) return;
   try{
     const stream=await navigator.mediaDevices.getUserMedia({video:{width:{ideal:640},height:{ideal:480},facingMode:'user'},audio:false});
     video.srcObject=stream; await video.play();
-    src.width=cut.width=maskC.width=video.videoWidth; src.height=cut.height=maskC.height=video.videoHeight;
-    camOn=true; return true;
-  }catch(e){ camError(e); return false; }
-}
-async function openCamera(){ if(!segmenter||!detector){ statusEl.textContent='Still loading the AI models… try again in a few seconds'; return; } if(await ensureCam()){ lastShot=null; setMode('camera'); } }
-async function startLive(){ if(mode==='live'){ setMode('idle'); return; } if(!segmenter||!detector) return; if(await ensureCam()) setMode('live'); }
-
-function grabFrame(){ // mirrored copy of the current camera frame
-  sctx.save(); sctx.scale(-1,1); sctx.drawImage(video,-src.width,0,src.width,src.height); sctx.restore();
-}
-function detectFaces(ts){
-  const det=detector.detectForVideo(src, ts);
-  faces=det.detections.map(d=>({x:d.boundingBox.originX,y:d.boundingBox.originY,w:d.boundingBox.width,h:d.boundingBox.height}));
-}
-// person mask of `src` → alpha into maskC. Returns coverage.
-function segment(ts){
-  let cov=0;
-  segmenter.segmentForVideo(src, ts, res=>{
-    const masks=res.confidenceMasks, m=masks[masks.length-1], data=m.getAsFloat32Array(), w=m.width, h=m.height;
-    if(!invertChecked && faces.length){ // person region should score high; compare face box vs top corners
-      const f=faces[0]; let fs=0,fn=0,cs=0,cn=0;
-      const x0=f.x/src.width*w|0, x1=(f.x+f.w)/src.width*w|0, y0=f.y/src.height*h|0, y1=(f.y+f.h)/src.height*h|0;
-      for(let y=y0;y<y1;y+=2) for(let x=x0;x<x1;x+=2){ fs+=data[y*w+x]; fn++; }
-      const cw=w*0.08|0, ch=h*0.08|0;
-      for(let y=0;y<ch;y++) for(let x=0;x<cw;x++){ cs+=data[y*w+x]+data[y*w+(w-1-x)]; cn+=2; }
-      const a=fs/(fn||1), b=cs/(cn||1);
-      if(Math.abs(a-b)>0.2){ invert=a<b; invertChecked=true; }
-    }
-    if(maskC.width!==w||maskC.height!==h){ maskC.width=w; maskC.height=h; }
-    const img=mctx.createImageData(w,h), a=img.data; let on=0;
-    for(let i=0,j=3;i<data.length;i++,j+=4){ const v=invert?1-data[i]:data[i]; if(v>0.4){ a[j]=Math.min(255,(v-0.4)*700|0); on++; } }
-    mctx.putImageData(img,0,0); cov=on/data.length;
-  });
-  return cov;
+    src.width=video.videoWidth; src.height=video.videoHeight;
+    camOn=true; running=true; $('start').textContent='Camera on'; $('start').disabled=true; touchBar();
+  }catch(e){ camError(e); }
 }
 
-// ---------- photo → sticker ----------
-let lastShot=null; // {frame:canvas, faces, face}
-function takePhoto(){
-  const ts=performance.now();
-  grabFrame(); detectFaces(ts);
-  const frame=document.createElement('canvas'); frame.width=src.width; frame.height=src.height; frame.getContext('2d').drawImage(src,0,0);
-  lastShot={frame, faces:faces.slice()};
-  segment(ts+1);
-  if(lastShot.faces.length===1){ buildSticker(lastShot.faces[0]); setMode('idle'); }
-  else if(lastShot.faces.length===0){ statusEl.textContent='No face found — face the camera and try again'; }
-  else setMode('pick');
-}
-function buildSticker(f){
-  lastShot.face=f;
-  const cp=CROPS[cropName];
-  const sx=Math.max(0,f.x+f.w/2-f.w*cp.side), sw=Math.min(src.width-sx,f.w*cp.side*2);
-  const sy=Math.max(0,f.y-f.h*cp.up), sh=Math.min(src.height-sy,f.h*cp.down);
-  const c=document.createElement('canvas'); c.width=Math.round(sw); c.height=Math.round(sh); const g=c.getContext('2d');
-  g.drawImage(lastShot.frame, sx,sy,sw,sh, 0,0,c.width,c.height);
-  // soft-edged person mask
-  const m=document.createElement('canvas'); m.width=c.width; m.height=c.height; const mg=m.getContext('2d');
-  mg.filter='blur(2px)';
-  mg.drawImage(maskC, sx/src.width*maskC.width, sy/src.height*maskC.height, sw/src.width*maskC.width, sh/src.height*maskC.height, 0,0,m.width,m.height);
-  g.globalCompositeOperation='destination-in'; g.drawImage(m,0,0); g.globalCompositeOperation='source-over';
-  sticker={c, faceBottom:(f.y+f.h)-sy, faceCx:(f.x+f.w/2)-sx};
-  statusEl.textContent='In the '+vehicle.e+' — switch vehicles anytime, or take a new photo';
+// ---------- one-euro smoothing (kills the jitter) ----------
+const F={};
+const alphaOf=(cut,rate)=>{ const tau=1/(2*Math.PI*cut); return 1/(1+tau*rate); };
+function smooth(key,v,dt){
+  const s = F[key] || (F[key]={hat:v,dhat:0,init:true});
+  if(s.init){ s.init=false; s.hat=v; return v; }
+  const rate=1/Math.max(dt,1/120);
+  const dv=(v-s.hat)*rate;
+  const ad=alphaOf(1.0,rate); s.dhat=ad*dv+(1-ad)*s.dhat;
+  const a=alphaOf(1.0+1.5*Math.abs(s.dhat),rate);
+  s.hat=a*v+(1-a)*s.hat;
+  return s.hat;
 }
 
-// ---------- emoji ink bounds (so the kid sits where the vehicle actually is) ----------
-const inkCache={};
-function ink(e){
-  if(inkCache[e]) return inkCache[e];
-  const S=200, c=document.createElement('canvas'); c.width=c.height=S; const g=c.getContext('2d');
-  g.font=`${S*0.6}px "Apple Color Emoji","Segoe UI Emoji","Noto Color Emoji",serif`; g.textAlign='center'; g.textBaseline='middle'; g.fillText(e,S/2,S/2);
-  const d=g.getImageData(0,0,S,S).data; let t=S,b=0,l=S,r=0;
-  for(let y=0;y<S;y++) for(let x=0;x<S;x++) if(d[(y*S+x)*4+3]>40){ if(y<t)t=y; if(y>b)b=y; if(x<l)l=x; if(x>r)r=x; }
-  const fs=S*0.6; return inkCache[e]={top:(t-S/2)/fs, bottom:(b-S/2)/fs, left:(l-S/2)/fs, right:(r-S/2)/fs};
-}
-
-// ---------- geometry / input ----------
+// ---------- geometry ----------
 function resize(){ stage.width=innerWidth*devicePixelRatio; stage.height=innerHeight*devicePixelRatio; }
 addEventListener('resize',resize); resize();
-function computeFit(){ const W=stage.width,H=stage.height,vw=src.width||4,vh=src.height||3; const s=Math.max(W/vw,H/vh); fit={s,ox:(W-vw*s)/2,oy:(H-vh*s)/2}; }
-const toCanvas=(x,y)=>[fit.ox+x*fit.s, fit.oy+y*fit.s];
-let lastTap=0;
-const onVehicle=(px,py)=>vx!=null && Math.abs(px-vx)<stage.height*vsizeF*0.5 && Math.abs(py-vy)<stage.height*vsizeF*0.5;
-stage.addEventListener('pointerdown',ev=>{
-  const px=ev.clientX*devicePixelRatio, py=ev.clientY*devicePixelRatio, now=performance.now();
-  if(mode==='idle'){ if(onVehicle(px,py)) openCamera(); return; }
-  if(mode==='pick'){
-    const x=(px-fit.ox)/fit.s, y=(py-fit.oy)/fit.s;
-    const hit=lastShot.faces.find(f=>x>=f.x-f.w*0.4&&x<=f.x+f.w*1.4&&y>=f.y-f.h*0.6&&y<=f.y+f.h*1.4);
-    if(hit){ buildSticker(hit); setMode('idle'); } return;
-  }
-  if(mode==='live'){
-    if(lock && onVehicle(px,py)){ if(now-lastTap<400){ lock=null;vx=vy=null;held=null; lastTap=0; return; } lastTap=now; drag={dx:vx-px,dy:vy-py}; stage.setPointerCapture(ev.pointerId); return; }
-    const x=(px-fit.ox)/fit.s, y=(py-fit.oy)/fit.s;
-    const hit=faces.find(f=>x>=f.x-f.w*0.3&&x<=f.x+f.w*1.3&&y>=f.y-f.h*0.3&&y<=f.y+f.h*1.3);
-    if(hit){ lock={cx:hit.x+hit.w/2,cy:hit.y+hit.h/2,w:hit.w,h:hit.h,lost:0}; vx=vy=null; held=null; }
-  }
-});
-stage.addEventListener('pointermove',ev=>{ if(drag){ vx=ev.clientX*devicePixelRatio+drag.dx; vy=ev.clientY*devicePixelRatio+drag.dy; } });
-stage.addEventListener('pointerup',()=>{ if(!drag) return; drag=null; const W=stage.width,H=stage.height,m=H*vsizeF*0.25;
-  if(vx<m||vx>W-m||vy<m||vy>H-m){ lock=null;vx=vy=null;held=null; } else held={x:vx,y:vy}; });
+function computeFit(){ const W=stage.width,H=stage.height,vw=src.width||640,vh=src.height||480;
+  const s=Math.max(W/vw,H/vh); fit={s,ox:(W-vw*s)/2,oy:(H-vh*s)/2}; }
+const P = i => { const p=lm[i]; return {x:fit.ox+p.x*src.width*fit.s, y:fit.oy+p.y*src.height*fit.s, v:p.visibility??1}; };
+const mid = (a,b)=>({x:(a.x+b.x)/2, y:(a.y+b.y)/2, v:Math.min(a.v,b.v)});
+const dist = (a,b)=>Math.hypot(a.x-b.x,a.y-b.y);
 
-// ---------- render ----------
+// ---------- pinch / pan to place the character ----------
+const pts=new Map(); let gest=null;
+stage.addEventListener('pointerdown',e=>{ pts.set(e.pointerId,{x:e.clientX,y:e.clientY}); stage.setPointerCapture(e.pointerId);
+  if(pts.size===1){ const p=[...pts.values()][0]; gest={mode:'pan',x:p.x,y:p.y,px:view.px,py:view.py}; }
+  else if(pts.size===2){ const [a,b]=[...pts.values()]; gest={mode:'pinch',d:Math.hypot(a.x-b.x,a.y-b.y),z:view.z}; }
+  else showBar();
+});
+stage.addEventListener('pointermove',e=>{
+  if(!pts.has(e.pointerId)) return; pts.set(e.pointerId,{x:e.clientX,y:e.clientY});
+  if(!gest) return;
+  if(gest.mode==='pan' && pts.size===1){ const p=[...pts.values()][0];
+    view.px=gest.px+(p.x-gest.x)*devicePixelRatio; view.py=gest.py+(p.y-gest.y)*devicePixelRatio; }
+  else if(gest.mode==='pinch' && pts.size===2){ const [a,b]=[...pts.values()];
+    const d=Math.hypot(a.x-b.x,a.y-b.y); view.z=Math.max(0.3,Math.min(3.5,gest.z*(d/(gest.d||1)))); }
+});
+function endPt(e){ pts.delete(e.pointerId); if(pts.size===0) gest=null;
+  else if(pts.size===1){ const p=[...pts.values()][0]; gest={mode:'pan',x:p.x,y:p.y,px:view.px,py:view.py}; } }
+stage.addEventListener('pointerup',endPt); stage.addEventListener('pointercancel',endPt);
+
+// ---------- character drawing ----------
+function capsule(a,b,w,color){ ctx.strokeStyle=color; ctx.lineWidth=w; ctx.lineCap='round'; ctx.lineJoin='round';
+  ctx.beginPath(); ctx.moveTo(a.x,a.y); ctx.lineTo(b.x,b.y); ctx.stroke(); }
+function edging(a,b,w,n){ // fur / spikes / bolts along a limb — deterministic so it never shimmers
+  const c=C(), dx=b.x-a.x, dy=b.y-a.y, len=Math.hypot(dx,dy)||1, px=-dy/len, py=dx/len;
+  ctx.fillStyle=c.shade;
+  for(let i=0;i<n;i++){
+    const t=(i+0.5)/n, s=i%2?1:-1, ox=a.x+dx*t+px*s*w*0.44, oy=a.y+dy*t+py*s*w*0.44;
+    if(c.edge==='fluff'){ ctx.beginPath(); ctx.arc(ox,oy,w*0.27,0,7); ctx.fill(); }
+    else if(c.edge==='spike'){ const sp=w*0.42;
+      ctx.beginPath(); ctx.moveTo(ox-dx/len*sp*0.7,oy-dy/len*sp*0.7);
+      ctx.lineTo(ox+px*s*sp,oy+py*s*sp); ctx.lineTo(ox+dx/len*sp*0.7,oy+dy/len*sp*0.7); ctx.closePath(); ctx.fill(); }
+    else { ctx.beginPath(); ctx.arc(ox,oy,w*0.12,0,7); ctx.fill(); }
+  }
+}
+function limb(a,b,w){ const c=C();
+  edging(a,b,w,Math.max(3,Math.round(dist(a,b)/(w*0.55))));
+  capsule(a,b,w+w*0.16,c.line); capsule(a,b,w,c.main); }
+
+function drawFace(head,R,angle){
+  // build a PORTRAIT box from head width — pose landmarks stop at the eyes/mouth,
+  // so their bounding box is a short wide strip and crops the forehead and chin off.
+  const e1=lm[7], e2=lm[8], n=lm[0];
+  const vis=Math.max(e1.visibility??1, e2.visibility??1, n.visibility??1);
+  if(vis<0.5) return false;
+  const cxp=((e1.x+e2.x)/2)*src.width, cyp=((e1.y+e2.y)/2)*src.height;
+  const ed=Math.hypot((e2.x-e1.x)*src.width,(e2.y-e1.y)*src.height);
+  if(ed<10) return false;
+  const sw=ed*1.95, sh=ed*2.5, sx=cxp-sw/2, sy=cyp-sh*0.40;
+  const w=Math.max(8,Math.round(sw)), h=Math.max(8,Math.round(sh));
+  if(fc.width!==w||fc.height!==h){ fc.width=fm.width=w; fc.height=fm.height=h; }
+  fctx.clearRect(0,0,w,h); fctx.drawImage(src,sx,sy,sw,sh,0,0,w,h);
+  // elliptical feather in unit space so it ALWAYS reaches full transparency at the
+  // boundary — a plain radial gradient leaves opaque corners and that reads as a pasted box
+  fmx.clearRect(0,0,w,h); fmx.save();
+  fmx.translate(w/2,h/2); fmx.scale(w/2,h/2);
+  const g=fmx.createRadialGradient(0,0,0.05,0,0,1);
+  g.addColorStop(0,'rgba(0,0,0,1)'); g.addColorStop(0.45,'rgba(0,0,0,1)');
+  g.addColorStop(0.72,'rgba(0,0,0,.6)'); g.addColorStop(0.9,'rgba(0,0,0,.18)'); g.addColorStop(1,'rgba(0,0,0,0)');
+  fmx.fillStyle=g; fmx.fillRect(-1,-1,2,2); fmx.restore();
+  fctx.globalCompositeOperation='destination-in'; fctx.drawImage(fm,0,0); fctx.globalCompositeOperation='source-over';
+  const dw=R*1.72, dh=dw*h/w;
+  ctx.save(); ctx.translate(head.x,head.y); ctx.rotate(angle);
+  ctx.drawImage(fc,-dw/2,-dh*0.52,dw,dh); ctx.restore();
+  return true;
+}
+function cartoonFace(head,R,angle){
+  const c=C();
+  ctx.save(); ctx.translate(head.x,head.y); ctx.rotate(angle);
+  ctx.fillStyle=c.skin; ctx.beginPath(); ctx.ellipse(0,R*0.1,R*0.62,R*0.7,0,0,7); ctx.fill();
+  ctx.fillStyle='#22303c';
+  ctx.beginPath(); ctx.arc(-R*0.26,-R*0.02,R*0.1,0,7); ctx.fill();
+  ctx.beginPath(); ctx.arc(R*0.26,-R*0.02,R*0.1,0,7); ctx.fill();
+  ctx.fillStyle=c.nose; ctx.beginPath(); ctx.ellipse(0,R*0.28,R*0.16,R*0.11,0,0,7); ctx.fill();
+  ctx.restore();
+}
+
+function drawPuppet(){
+  const c=C();
+  const Ls=P(11), Rs=P(12), Lh=P(23), Rh=P(24);
+  const shoulders=mid(Ls,Rs), hips=mid(Lh,Rh);
+  const sw=dist(Ls,Rs);
+  if(!(sw>4) || shoulders.v<0.35) return false;
+  const unit=sw;                              // everything scales off shoulder width
+  const armW=unit*0.34*c.build, legW=unit*0.40*c.build, torsoW=unit*1.12*c.build;
+  const ear1=P(7), ear2=P(8);
+  const headC={ x:(ear1.x+ear2.x)/2, y:(ear1.y+ear2.y)/2 };
+  const earD=dist(ear1,ear2);
+  const R=Math.max(unit*0.40, earD*0.80)*c.build;
+  const angle=Math.atan2(ear2.y-ear1.y, ear2.x-ear1.x);
+
+  // auto-frame: whatever the camera distance, the character fills a sane slice of the screen
+  const KEY=[0,11,12,13,14,15,16,23,24,25,26,27,28];
+  let x0=1e9,y0=1e9,x1=-1e9,y1=-1e9;
+  for(const i of KEY){ const p=P(i); if(p.v<0.3) continue;
+    x0=Math.min(x0,p.x); x1=Math.max(x1,p.x); y0=Math.min(y0,p.y); y1=Math.max(y1,p.y); }
+  y0=Math.min(y0, headC.y-R*1.35);                      // head sits above every landmark
+  y1+=legW*0.8;                                          // feet sit below the ankles
+  const bh=Math.max(y1-y0,1), bcx=(x0+x1)/2, bcy=(y0+y1)/2;
+  const W=stage.width, H=stage.height;
+  const A=smooth('autoS', Math.max(0.05,Math.min(4,(H*0.62)/bh)), 1/60);
+  const fx=smooth('autoX',bcx,1/60), fy=smooth('autoY',bcy,1/60);
+
+  ctx.save();
+  ctx.translate(W/2+view.px, H*0.45+view.py);
+  ctx.scale(view.z*A, view.z*A);
+  ctx.translate(-fx,-fy);
+
+  // legs (behind)
+  const Lk=P(25), Rk=P(26), La=P(27), Ra=P(28);
+  if(Lk.v>0.3){ limb(Lh,Lk,legW); if(La.v>0.3){ limb(Lk,La,legW*0.85); foot(La,Lk,legW); } }
+  if(Rk.v>0.3){ limb(Rh,Rk,legW); if(Ra.v>0.3){ limb(Rk,Ra,legW*0.85); foot(Ra,Rk,legW); } }
+  // torso
+  limb(shoulders,hips,torsoW);
+  { const m=mid(shoulders,hips), tl=dist(shoulders,hips);
+    ctx.fillStyle=c.shade; ctx.globalAlpha=.28;
+    ctx.beginPath(); ctx.ellipse(m.x,m.y+tl*0.16, torsoW*0.22, tl*0.24, angle,0,7); ctx.fill();
+    ctx.globalAlpha=1; }
+  // arms
+  const Le=P(13), Re=P(14), Lw=P(15), Rw=P(16);
+  if(Le.v>0.3){ limb(Ls,Le,armW); if(Lw.v>0.3){ limb(Le,Lw,armW*0.88); hand(Lw,armW); } }
+  if(Re.v>0.3){ limb(Rs,Re,armW); if(Rw.v>0.3){ limb(Re,Rw,armW*0.88); hand(Rw,armW); } }
+  // head
+  headEdge(headC,R);
+  ctx.fillStyle=c.line; ctx.beginPath(); ctx.arc(headC.x,headC.y,R*1.06,0,7); ctx.fill();
+  ctx.fillStyle=c.main; ctx.beginPath(); ctx.arc(headC.x,headC.y,R,0,7); ctx.fill();
+  headExtras(headC,R,angle);
+  if(!(faceOn && drawFace(headC,R,angle))) cartoonFace(headC,R,angle);
+
+  ctx.restore();
+  return true;
+}
+function headEdge(h,R){ // fur / spikes / plating ringing the head
+  const c=C(), n=c.edge==='bolt'?10:16;
+  ctx.fillStyle=c.shade;
+  for(let i=0;i<n;i++){
+    const a=i/n*Math.PI*2, ox=h.x+Math.cos(a)*R*0.96, oy=h.y+Math.sin(a)*R*0.96;
+    if(c.edge==='spike'){ const t=a+Math.PI/2, sp=R*0.3;
+      ctx.beginPath(); ctx.moveTo(ox+Math.cos(t)*sp*0.5,oy+Math.sin(t)*sp*0.5);
+      ctx.lineTo(h.x+Math.cos(a)*R*1.34, h.y+Math.sin(a)*R*1.34);
+      ctx.lineTo(ox-Math.cos(t)*sp*0.5,oy-Math.sin(t)*sp*0.5); ctx.closePath(); ctx.fill(); }
+    else if(c.edge==='bolt'){ ctx.beginPath(); ctx.arc(ox,oy,R*0.07,0,7); ctx.fill(); }
+    else { ctx.beginPath(); ctx.arc(ox,oy,R*0.26,0,7); ctx.fill(); }
+  }
+}
+function hand(p,w){ ctx.fillStyle=C().main; ctx.beginPath(); ctx.arc(p.x,p.y,w*0.62,0,7); ctx.fill();
+  ctx.fillStyle=C().shade; ctx.beginPath(); ctx.arc(p.x,p.y,w*0.62,0,7); ctx.globalAlpha=.25; ctx.fill(); ctx.globalAlpha=1; }
+function foot(a,from,w){ const dx=a.x-from.x, dy=a.y-from.y, l=Math.hypot(dx,dy)||1;
+  ctx.fillStyle=C().shade; ctx.save(); ctx.translate(a.x,a.y); ctx.rotate(Math.atan2(dy,dx)-Math.PI/2);
+  ctx.beginPath(); ctx.ellipse(0,w*0.18,w*0.55,w*0.78,0,0,7); ctx.fill(); ctx.restore(); }
+function headExtras(h,R,ang){
+  const c=C(); ctx.save(); ctx.translate(h.x,h.y); ctx.rotate(ang); ctx.fillStyle=c.shade;
+  if(charName==='yeti'){ ctx.beginPath(); ctx.arc(-R*0.86,-R*0.48,R*0.28,0,7); ctx.fill();
+                         ctx.beginPath(); ctx.arc(R*0.86,-R*0.48,R*0.28,0,7); ctx.fill(); }
+  else if(charName==='dino'){ ctx.fillStyle=c.trim; for(let i=-1;i<=1;i++){
+      ctx.beginPath(); ctx.moveTo(i*R*0.42-R*0.16,-R*0.92); ctx.lineTo(i*R*0.42,-R*1.42); ctx.lineTo(i*R*0.42+R*0.16,-R*0.92); ctx.closePath(); ctx.fill(); } }
+  else { ctx.strokeStyle=c.shade; ctx.lineWidth=R*0.09; ctx.beginPath(); ctx.moveTo(0,-R); ctx.lineTo(0,-R*1.45); ctx.stroke();
+         ctx.fillStyle=c.trim; ctx.beginPath(); ctx.arc(0,-R*1.5,R*0.16,0,7); ctx.fill(); }
+  ctx.restore();
+}
+
+// ---------- scenes ----------
 function drawScene(W,H){
   let g;
+  if(scene==='plain'){ ctx.fillStyle='#eef3f8'; ctx.fillRect(0,0,W,H); return; }
+  if(scene==='snow'){ g=ctx.createLinearGradient(0,0,0,H); g.addColorStop(0,'#bfe0f5'); g.addColorStop(.7,'#eaf6ff'); ctx.fillStyle=g; ctx.fillRect(0,0,W,H*0.78);
+    ctx.fillStyle='#fbfdff'; ctx.beginPath(); ctx.moveTo(0,H*0.78); ctx.lineTo(W*0.3,H*0.62); ctx.lineTo(W*0.55,H*0.78); ctx.closePath(); ctx.fill();
+    ctx.beginPath(); ctx.moveTo(W*0.45,H*0.78); ctx.lineTo(W*0.75,H*0.58); ctx.lineTo(W,H*0.78); ctx.closePath(); ctx.fill();
+    ctx.fillStyle='#f4fbff'; ctx.fillRect(0,H*0.78,W,H*0.22);
+    ctx.fillStyle='#dbeefb'; for(let i=0;i<60;i++) ctx.fillRect((i*137)%W,(i*211)%(H*0.75),3,3); return; }
   if(scene==='sky'){ g=ctx.createLinearGradient(0,0,0,H); g.addColorStop(0,'#6fb7ff'); g.addColorStop(1,'#dff1ff'); ctx.fillStyle=g; ctx.fillRect(0,0,W,H);
-    ctx.font=`${H*0.12}px serif`; ctx.textAlign='left'; ctx.textBaseline='alphabetic'; ctx.fillText('☁️',W*0.15,H*0.25); ctx.fillText('☁️',W*0.65,H*0.18); ctx.fillText('🌞',W*0.85,H*0.15); }
-  else if(scene==='space'){ ctx.fillStyle='#0b1a3a'; ctx.fillRect(0,0,W,H); ctx.fillStyle='#fff'; for(let i=0;i<80;i++) ctx.fillRect((i*97)%W,(i*193)%H,3,3);
-    ctx.font=`${H*0.12}px serif`; ctx.textAlign='left'; ctx.textBaseline='alphabetic'; ctx.fillText('🌍',W*0.8,H*0.25); ctx.fillText('🌙',W*0.1,H*0.2); }
-  else { g=ctx.createLinearGradient(0,0,0,H); g.addColorStop(0,'#8fcbff'); g.addColorStop(0.72,'#e9f5ff'); ctx.fillStyle=g; ctx.fillRect(0,0,W,H*0.72);
-    ctx.fillStyle='#8ccf6e'; ctx.fillRect(0,H*0.72,W,H*0.28); ctx.fillStyle='#4a4a4a'; ctx.fillRect(0,H*0.82,W,H*0.12);
-    ctx.fillStyle='#fff'; for(let x=0;x<W;x+=W*0.12) ctx.fillRect(x,H*0.875,W*0.06,H*0.01);
-    ctx.font=`${H*0.12}px serif`; ctx.textAlign='left'; ctx.textBaseline='alphabetic'; ctx.fillText('🌳',W*0.05,H*0.78); ctx.fillText('🏠',W*0.75,H*0.78); ctx.fillText('🌞',W*0.85,H*0.15); }
+    ctx.font=`${H*0.11}px serif`; ctx.textAlign='left'; ctx.textBaseline='alphabetic';
+    ctx.fillText('☁️',W*0.12,H*0.24); ctx.fillText('☁️',W*0.66,H*0.17); ctx.fillText('🌞',W*0.85,H*0.14); return; }
+  if(scene==='space'){ ctx.fillStyle='#0b1a3a'; ctx.fillRect(0,0,W,H); ctx.fillStyle='#fff';
+    for(let i=0;i<90;i++) ctx.fillRect((i*97)%W,(i*193)%H,3,3);
+    ctx.font=`${H*0.11}px serif`; ctx.textAlign='left'; ctx.textBaseline='alphabetic';
+    ctx.fillText('🌍',W*0.78,H*0.26); ctx.fillText('🌙',W*0.1,H*0.2); return; }
+  g=ctx.createLinearGradient(0,0,0,H); g.addColorStop(0,'#8fcbff'); g.addColorStop(.72,'#e9f5ff'); ctx.fillStyle=g; ctx.fillRect(0,0,W,H*0.72);
+  ctx.fillStyle='#8ccf6e'; ctx.fillRect(0,H*0.72,W,H*0.28); ctx.fillStyle='#4a4a4a'; ctx.fillRect(0,H*0.82,W,H*0.12);
+  ctx.fillStyle='#fff'; for(let x=0;x<W;x+=W*0.12) ctx.fillRect(x,H*0.875,W*0.06,H*0.01);
+  ctx.font=`${H*0.11}px serif`; ctx.textAlign='left'; ctx.textBaseline='alphabetic';
+  ctx.fillText('🌳',W*0.05,H*0.78); ctx.fillText('🏠',W*0.76,H*0.78);
 }
-// draws vehicle at (x,y) with the given rider (sticker-like {c,faceBottom,faceCx}) sitting in it
-function drawVehicle(x,y,rider){
-  const H=stage.height, vs=H*vsizeF, fs=vs*0.9, k=ink(vehicle.e);
-  ctx.font=`${fs}px "Apple Color Emoji","Segoe UI Emoji","Noto Color Emoji",serif`; ctx.textAlign='center'; ctx.textBaseline='middle';
-  ctx.fillText(vehicle.e,x,y);
-  if(rider){
-    const inkTop=y+k.top*fs, inkH=(k.bottom-k.top)*fs, inkW=(k.right-k.left)*fs, inkCx=x+(k.left+k.right)/2*fs;
-    const seatY=inkTop+inkH*vehicle.seat;
-    const dw=inkW*vehicle.kid, sc=dw/rider.c.width, dh=rider.c.height*sc;
-    const dx=inkCx-rider.faceCx*sc, dy=seatY-rider.faceBottom*sc;
-    ctx.drawImage(rider.c,dx,dy,dw,dh);
-    ctx.save(); ctx.beginPath(); ctx.rect(x-fs, seatY, fs*2, y+fs-seatY); ctx.clip(); ctx.fillText(vehicle.e,x,y); ctx.restore();
-  }
-}
-function vehicleHome(ts){ const W=stage.width,H=stage.height; return [W/2, (scene==='road'?H*0.62:H*0.5)+Math.sin(ts/600)*H*0.01]; }
 
+// ---------- loop ----------
 function loop(ts){
-  const W=stage.width, H=stage.height; computeFit();
-  if(mode==='camera'||mode==='live'){ if(camOn && video.readyState>=2){ grabFrame(); detectFaces(ts); } }
-  if(mode==='camera'){
-    ctx.drawImage(src,fit.ox,fit.oy,src.width*fit.s,src.height*fit.s);
-    ctx.strokeStyle='#ffd400'; ctx.lineWidth=4; for(const f of faces){ const [a,b]=toCanvas(f.x,f.y); ctx.strokeRect(a,b,f.w*fit.s,f.h*fit.s); }
-    statusEl.textContent = faces.length ? `${faces.length} face${faces.length>1?'s':''} — press the button` : 'Face the camera…';
-  }
-  else if(mode==='pick'){
-    ctx.drawImage(lastShot.frame,fit.ox,fit.oy,src.width*fit.s,src.height*fit.s);
-    ctx.strokeStyle='#ffd400'; ctx.lineWidth=5; for(const f of lastShot.faces){ const [a,b]=toCanvas(f.x,f.y); ctx.strokeRect(a,b,f.w*fit.s,f.h*fit.s); }
-    statusEl.textContent='Tap the face you want in the '+vehicle.e;
-  }
-  else if(mode==='live'){
-    if(camOn && video.readyState>=2){
-      maskCoverage=segment(ts);
-      cctx.globalCompositeOperation='source-over'; cctx.drawImage(src,0,0); cctx.globalCompositeOperation='destination-in'; cctx.drawImage(maskC,0,0,cut.width,cut.height); cctx.globalCompositeOperation='source-over';
-      if(lock){ let best=null,bd=Infinity; for(const f of faces){ const d=Math.hypot(f.x+f.w/2-lock.cx,f.y+f.h/2-lock.cy); if(d<bd){bd=d;best=f;} }
-        if(best&&bd<lock.w*2){ const k=0.35; lock.cx+=(best.x+best.w/2-lock.cx)*k; lock.cy+=(best.y+best.h/2-lock.cy)*k; lock.w+=(best.w-lock.w)*k; lock.h+=(best.h-lock.h)*k; lock.lost=0; } else lock.lost++; }
-    }
-    drawScene(W,H);
-    if(!lock){
-      ctx.drawImage(cut,fit.ox,fit.oy,cut.width*fit.s,cut.height*fit.s);
-      ctx.strokeStyle='rgba(31,111,235,.9)'; ctx.lineWidth=4; ctx.setLineDash([12,8]); for(const f of faces){ const [a,b]=toCanvas(f.x,f.y); ctx.strokeRect(a,b,f.w*fit.s,f.h*fit.s); } ctx.setLineDash([]);
-      statusEl.textContent = maskCoverage<0.01 && faces.length ? '⚠️ cutout empty' : (faces.length ? 'Live — tap a face to put them in the '+vehicle.e : 'Live — looking for faces…');
-    } else {
-      const vs=H*vsizeF; const [fx]=toCanvas(lock.cx,lock.cy);
-      const tx=Math.max(vs*0.5,Math.min(W-vs*0.5,fx)), [,ty]=vehicleHome(ts);
-      if(drag){} else if(held){ vx=held.x; vy=held.y+Math.sin(ts/500)*H*0.01; } else if(vx==null){ vx=tx; vy=ty; } else { vx+=(tx-vx)*0.08; vy+=(ty-vy)*0.08; }
-      const cp=CROPS[cropName]; const sw=lock.w*cp.side*2, sx=lock.cx-sw/2, sy=lock.cy-lock.h/2-lock.h*cp.up, sh=lock.h*cp.down;
-      const rc=document.createElement('canvas'); rc.width=Math.max(1,sw|0); rc.height=Math.max(1,sh|0); rc.getContext('2d').drawImage(cut,sx,sy,sw,sh,0,0,rc.width,rc.height);
-      drawVehicle(vx,vy,{c:rc,faceBottom:(lock.cy+lock.h/2)-sy,faceCx:lock.cx-sx});
-      statusEl.textContent = lock.lost>15 ? '🟠 lost the face — look at the camera' : 'Drag the '+vehicle.e+' · fling off the edge or double-tap to let them out';
-    }
-  }
-  else { // idle
-    drawScene(W,H);
-    if(vx==null||!held){ const [hx,hy]=vehicleHome(ts); vx=hx; vy=hy; }
-    drawVehicle(vx,vy,sticker);
-    if(!sticker) statusEl.textContent = segmenter ? 'Tap the '+vehicle.e+' (or 📷) to take a photo' : 'Loading AI models…';
-  }
   requestAnimationFrame(loop);
+  const W=stage.width,H=stage.height;
+  computeFit(); drawScene(W,H);
+
+  if(!running){ statusEl.textContent = landmarker ? 'Press Start camera' : 'Loading the body-tracking model…'; return; }
+  if(video.readyState>=2 && ts!==lastTs){
+    const dt=(ts-lastTs)/1000; lastTs=ts;
+    sctx.save(); sctx.scale(-1,1); sctx.drawImage(video,-src.width,0,src.width,src.height); sctx.restore();
+    const res=landmarker.detectForVideo(src,ts);
+    const raw=res.landmarks&&res.landmarks[0];
+    if(raw){
+      lm=raw.map((p,i)=>({ x:smooth(i+'x',p.x,dt), y:smooth(i+'y',p.y,dt), visibility:p.visibility }));
+      lastSeen=ts;
+    } else if(ts-lastSeen>900) lm=null;
+  }
+  if(lm && drawPuppet()) statusEl.textContent='Drag to move · pinch to size · they move, '+charName+' moves';
+  else statusEl.textContent='Step back so your whole body is in frame 🕺';
 }
 requestAnimationFrame(loop);
 
-// ---------- models ----------
+// ---------- model ----------
 (async()=>{
   try{
     const vision=await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
-    segmenter=await ImageSegmenter.createFromOptions(vision,{ baseOptions:{modelAssetPath:"https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter/float16/latest/selfie_segmenter.tflite",delegate:"CPU"},
-      runningMode:"VIDEO", outputCategoryMask:false, outputConfidenceMasks:true });
-    detector=await FaceDetector.createFromOptions(vision,{ baseOptions:{modelAssetPath:"https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/1/blaze_face_short_range.tflite",delegate:"GPU"},
-      runningMode:"VIDEO", minDetectionConfidence:0.5 });
-  }catch(e){ statusEl.textContent='Model load failed: '+e.message; console.error(e); }
+    const MODEL="https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task";
+    const make = d => PoseLandmarker.createFromOptions(vision,{
+      baseOptions:{ modelAssetPath:MODEL, delegate:d },
+      runningMode:"VIDEO", numPoses:1, minPoseDetectionConfidence:0.5, minTrackingConfidence:0.5 });
+    try { landmarker=await make("GPU"); }
+    catch(gpuErr){ console.warn('GPU delegate failed, falling back to CPU',gpuErr); landmarker=await make("CPU"); }
+    $('start').disabled=false; $('start').textContent='Start camera';
+    statusEl.textContent='Ready — press Start camera';
+  }catch(e){ statusEl.textContent='Model failed to load: '+e.message; console.error(e); }
 })();
 </script>
 </body>
