@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>KidCam</title>
+<style>
+  html,body{margin:0;height:100%;background:#eef3f8;color:#1a2330;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;overflow:hidden}
+  #stage{position:fixed;inset:0;width:100%;height:100%;display:block;touch-action:none;background:#eef3f8}
+  #video{display:none}
+  #bar{position:fixed;left:0;right:0;bottom:0;display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:8px 10px;
+       background:rgba(255,255,255,.92);border-top:1px solid #d7dee6;transition:transform .25s;font-size:14px}
+  #bar.hidden{transform:translateY(100%)}
+  button,select{font:inherit;padding:8px 12px;border-radius:10px;border:1px solid #c5ced9;background:#fff;color:#1a2330;cursor:pointer}
+  button.primary{background:#1f6feb;border-color:#1f6feb;color:#fff}
+  button.on{background:#dfe9ff;border-color:#1f6feb}
+  .veh{font-size:26px;padding:4px 8px;line-height:1}
+  .veh.on{background:#dfe9ff;border-color:#1f6feb}
+  #status{position:fixed;top:10px;left:10px;background:rgba(255,255,255,.9);padding:6px 10px;border-radius:8px;font-size:13px;border:1px solid #d7dee6}
+  #peek{position:fixed;right:10px;bottom:10px;width:40px;height:40px;border-radius:50%;background:rgba(255,255,255,.75);border:1px solid #c5ced9;font-size:18px;display:none;z-index:2}
+  .sep{width:1px;height:28px;background:#d7dee6}
+  label{display:flex;align-items:center;gap:4px}
+</style>
+</head>
+<body>
+<video id="video" playsinline muted autoplay></video>
+<canvas id="stage"></canvas>
+<div id="status">Loading models…</div>
+<button id="peek" title="Show controls">⚙</button>
+
+<div id="bar">
+  <button id="start" class="primary">Start camera</button>
+  <div class="sep"></div>
+  <span id="vehicles"></span>
+  <div class="sep"></div>
+  <label>Crop <select id="crop"><option value="2.0">Shoulders</option><option value="3.2" selected>Waist</option></select></label>
+  <label>Scene <select id="scene">
+    <option value="sky">Sky</option><option value="road" selected>Road</option><option value="space">Space</option><option value="live">Live camera</option>
+  </select></label>
+  <label>Size <input id="vsize" type="range" min="0.25" max="0.7" step="0.01" value="0.45"></label>
+  <button id="invert">Invert mask</button>
+  <button id="release">Release</button>
+  <button id="fs">Fullscreen</button>
+  <button id="hide">Hide</button>
+</div>
+
+<script type="module">
+import { FilesetResolver, ImageSegmenter, FaceDetector } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+
+const $ = id => document.getElementById(id);
+const video = $('video'), stage = $('stage'), ctx = stage.getContext('2d');
+const statusEl = $('status');
+const cut = document.createElement('canvas'), cctx = cut.getContext('2d');      // person cutout (RGBA)
+const maskC = document.createElement('canvas'), mctx = maskC.getContext('2d');  // alpha mask
+
+const VEHICLES = [
+  {e:'🚗', seat:0.42, kid:0.55}, {e:'🚌', seat:0.30, kid:0.55}, {e:'🚂', seat:0.35, kid:0.5},
+  {e:'✈️', seat:0.40, kid:0.45}, {e:'🚀', seat:0.45, kid:0.45}, {e:'🚁', seat:0.55, kid:0.45},
+  {e:'🚤', seat:0.40, kid:0.5},  {e:'🦖', seat:0.35, kid:0.5},  {e:'🎈', seat:0.95, kid:0.5},
+];
+let vehicle = VEHICLES[0];
+let invert = false, autoInvertChecked = false;
+let cropK = 3.2, scene = 'road', vsizeF = 0.45;
+let lock = null;          // {cx,cy,w,h,lost}
+let vx = null, vy = null; // smoothed vehicle position (canvas px)
+let faces = [];           // last detections in video px
+let fit = {s:1, ox:0, oy:0};
+let segmenter, detector, running = false, lastTs = -1;
+
+// ---------- UI ----------
+const vehWrap = $('vehicles');
+VEHICLES.forEach((v,i)=>{ const b=document.createElement('button'); b.className='veh'+(i===0?' on':''); b.textContent=v.e;
+  b.onclick=()=>{ vehicle=v; [...vehWrap.children].forEach(c=>c.classList.remove('on')); b.classList.add('on'); touchBar(); }; vehWrap.appendChild(b); });
+$('crop').onchange = e => cropK = +e.target.value;
+$('scene').onchange = e => scene = e.target.value;
+$('vsize').oninput = e => vsizeF = +e.target.value;
+$('invert').onclick = () => { invert=!invert; $('invert').classList.toggle('on',invert); autoInvertChecked=true; touchBar(); };
+$('release').onclick = () => { lock=null; vx=vy=null; touchBar(); };
+$('fs').onclick = () => document.documentElement.requestFullscreen?.().catch(()=>{});
+$('hide').onclick = () => hideBar();
+$('peek').onclick = () => showBar();
+let barTimer;
+function hideBar(){ $('bar').classList.add('hidden'); $('peek').style.display='block'; }
+function showBar(){ $('bar').classList.remove('hidden'); $('peek').style.display='none'; touchBar(); }
+function touchBar(){ clearTimeout(barTimer); if(running) barTimer=setTimeout(hideBar, 6000); }
+$('bar').addEventListener('pointerdown', touchBar);
+
+$('start').onclick = async () => {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ video:{ width:{ideal:640}, height:{ideal:480}, facingMode:'user' }, audio:false });
+    video.srcObject = stream; await video.play();
+    cut.width = maskC.width = video.videoWidth; cut.height = maskC.height = video.videoHeight;
+    running = true; $('start').textContent='Camera on'; $('start').disabled=true; touchBar();
+    requestAnimationFrame(loop);
+  } catch(e){ statusEl.textContent = 'Camera error: ' + e.message; }
+};
+
+// ---------- models ----------
+(async () => {
+  try {
+    const vision = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+    segmenter = await ImageSegmenter.createFromOptions(vision, {
+      baseOptions:{ modelAssetPath:"https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter/float16/latest/selfie_segmenter.tflite", delegate:"GPU" },
+      runningMode:"VIDEO", outputCategoryMask:false, outputConfidenceMasks:true });
+    detector = await FaceDetector.createFromOptions(vision, {
+      baseOptions:{ modelAssetPath:"https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/1/blaze_face_short_range.tflite", delegate:"GPU" },
+      runningMode:"VIDEO", minDetectionConfidence:0.5 });
+    statusEl.textContent = 'Ready — press Start camera';
+    window.__ready = true;
+  } catch(e){ statusEl.textContent = 'Model load failed: ' + e.message; console.error(e); }
+})();
+
+// ---------- geometry ----------
+function resize(){ stage.width = innerWidth * devicePixelRatio; stage.height = innerHeight * devicePixelRatio; }
+addEventListener('resize', resize); resize();
+function computeFit(){
+  const W=stage.width, H=stage.height, vw=cut.width, vh=cut.height;
+  const s = Math.max(W/vw, H/vh); fit = { s, ox:(W - vw*s)/2, oy:(H - vh*s)/2 };
+}
+const toCanvas = (x,y) => [fit.ox + x*fit.s, fit.oy + y*fit.s];
+
+// tap: lock onto a face, or double-tap vehicle to release
+let lastTap = 0;
+stage.addEventListener('pointerdown', ev => {
+  if(!running) { showBar(); return; }
+  const px = ev.clientX*devicePixelRatio, py = ev.clientY*devicePixelRatio;
+  const now = performance.now();
+  if(lock && vx!=null){ const vs = stage.height*vsizeF; if(Math.abs(px-vx)<vs*0.6 && Math.abs(py-vy)<vs*0.6 && now-lastTap<400){ lock=null; vx=vy=null; } lastTap=now; }
+  const x = (px - fit.ox)/fit.s, y = (py - fit.oy)/fit.s;
+  const hit = faces.find(f => x>=f.x-f.w*0.3 && x<=f.x+f.w*1.3 && y>=f.y-f.h*0.3 && y<=f.y+f.h*1.3);
+  if(hit){ lock = {cx:hit.x+hit.w/2, cy:hit.y+hit.h/2, w:hit.w, h:hit.h, lost:0}; vx=vy=null; }
+  else showBar();
+});
+
+// ---------- per-frame ----------
+function loop(){
+  if(!running) return;
+  const ts = performance.now();
+  if(video.readyState >= 2 && ts !== lastTs){
+    lastTs = ts;
+    segmenter.segmentForVideo(video, ts, res => {
+      const masks = res.confidenceMasks; const m = masks[masks.length-1];
+      const data = m.getAsFloat32Array(), w=m.width, h=m.height;
+      if(!autoInvertChecked && faces.length){ // sample: person region vs corners
+        const f=faces[0]; const sx=(f.x+f.w/2)/cut.width*w|0, sy=(f.y+f.h/2)/cut.height*h|0;
+        const face=data[sy*w+sx], corner=(data[0]+data[w-1])/2;
+        invert = face < corner; $('invert').classList.toggle('on',invert); autoInvertChecked=true;
+      }
+      const img = mctx.createImageData(w,h); const a=img.data;
+      for(let i=0,j=3;i<data.length;i++,j+=4){ const v=invert?1-data[i]:data[i]; a[j] = v>0.35 ? Math.min(255, (v-0.35)*600|0) : 0; }
+      if(maskC.width!==w||maskC.height!==h){ maskC.width=w; maskC.height=h; }
+      mctx.putImageData(img,0,0);
+      cctx.globalCompositeOperation='source-over'; cctx.drawImage(video,0,0,cut.width,cut.height);
+      cctx.globalCompositeOperation='destination-in'; cctx.drawImage(maskC,0,0,cut.width,cut.height);
+      cctx.globalCompositeOperation='source-over';
+    });
+    const det = detector.detectForVideo(video, ts);
+    faces = det.detections.map(d => ({x:d.boundingBox.originX, y:d.boundingBox.originY, w:d.boundingBox.width, h:d.boundingBox.height}));
+    if(lock){
+      let best=null, bd=Infinity;
+      for(const f of faces){ const d=Math.hypot(f.x+f.w/2-lock.cx, f.y+f.h/2-lock.cy); if(d<bd){bd=d;best=f;} }
+      if(best && bd < lock.w*2){ const k=0.35; lock.cx+=(best.x+best.w/2-lock.cx)*k; lock.cy+=(best.y+best.h/2-lock.cy)*k; lock.w+=(best.w-lock.w)*k; lock.h+=(best.h-lock.h)*k; lock.lost=0; }
+      else lock.lost++;
+    }
+  }
+  draw(ts);
+  requestAnimationFrame(loop);
+}
+
+function drawScene(W,H){
+  if(scene==='live'){ ctx.drawImage(video, fit.ox, fit.oy, cut.width*fit.s, cut.height*fit.s); return; }
+  let g;
+  if(scene==='sky'){ g=ctx.createLinearGradient(0,0,0,H); g.addColorStop(0,'#6fb7ff'); g.addColorStop(1,'#dff1ff'); ctx.fillStyle=g; ctx.fillRect(0,0,W,H);
+    ctx.font=`${H*0.12}px serif`; ctx.fillText('☁️', W*0.15, H*0.25); ctx.fillText('☁️', W*0.65, H*0.18); ctx.fillText('🌞', W*0.85, H*0.15); }
+  else if(scene==='space'){ ctx.fillStyle='#0b1a3a'; ctx.fillRect(0,0,W,H); ctx.fillStyle='#fff';
+    for(let i=0;i<80;i++){ const x=(i*97)%W, y=(i*193)%H; ctx.fillRect(x,y,3,3);} ctx.font=`${H*0.12}px serif`; ctx.fillText('🌍', W*0.8, H*0.25); ctx.fillText('🌙', W*0.1, H*0.2); }
+  else { g=ctx.createLinearGradient(0,0,0,H); g.addColorStop(0,'#8fcbff'); g.addColorStop(0.72,'#e9f5ff'); ctx.fillStyle=g; ctx.fillRect(0,0,W*1,H*0.72);
+    ctx.fillStyle='#8ccf6e'; ctx.fillRect(0,H*0.72,W,H*0.28); ctx.fillStyle='#4a4a4a'; ctx.fillRect(0,H*0.82,W,H*0.12);
+    ctx.fillStyle='#fff'; for(let x=0;x<W;x+=W*0.12) ctx.fillRect(x,H*0.875,W*0.06,H*0.01);
+    ctx.font=`${H*0.12}px serif`; ctx.fillText('🌳', W*0.05, H*0.78); ctx.fillText('🏠', W*0.75, H*0.78); ctx.fillText('🌞', W*0.85, H*0.15); }
+}
+
+function draw(ts){
+  const W=stage.width, H=stage.height; computeFit();
+  drawScene(W,H);
+  if(!lock){
+    ctx.drawImage(cut, fit.ox, fit.oy, cut.width*fit.s, cut.height*fit.s);
+    ctx.strokeStyle='rgba(31,111,235,.9)'; ctx.lineWidth=4; ctx.setLineDash([12,8]);
+    for(const f of faces){ const [x,y]=toCanvas(f.x,f.y); ctx.strokeRect(x,y,f.w*fit.s,f.h*fit.s); }
+    ctx.setLineDash([]);
+    return;
+  }
+  // vehicle position follows the locked face (smoothed)
+  const vs = H*vsizeF;
+  const [fx] = toCanvas(lock.cx, lock.cy);
+  const targetX = Math.max(vs*0.5, Math.min(W-vs*0.5, fx));
+  const targetY = (scene==='road' ? H*0.80 : H*0.55) + Math.sin(ts/500)*H*0.01;
+  if(vx==null){ vx=targetX; vy=targetY; } else { vx+=(targetX-vx)*0.08; vy+=(targetY-vy)*0.08; }
+  const left = vx - vs/2, top = vy - vs/2;
+  ctx.font = `${vs*0.9}px "Apple Color Emoji","Segoe UI Emoji","Noto Color Emoji",serif`;
+  ctx.textAlign='center'; ctx.textBaseline='middle';
+  // 1) vehicle
+  ctx.fillText(vehicle.e, vx, vy);
+  // 2) kid cutout: crop around face, bottom edge = seat line
+  const sw = lock.w*3.2, sx = lock.cx - sw/2, sy = lock.cy - lock.h*1.1, sh = lock.h*cropK;
+  const dw = vs*vehicle.kid, dh = dw*sh/sw, seatY = top + vs*vehicle.seat;
+  const dx = vx - dw/2, dy = seatY - dh;
+  ctx.save(); ctx.beginPath(); ctx.rect(dx, dy, dw, dh); ctx.clip();
+  ctx.drawImage(cut, sx, sy, sw, sh, dx, dy, dw, dh); ctx.restore();
+  // 3) vehicle body over the kid so he sits "inside"
+  ctx.save(); ctx.beginPath(); ctx.rect(left, seatY, vs, vs - vs*vehicle.seat); ctx.clip();
+  ctx.fillText(vehicle.e, vx, vy); ctx.restore();
+  if(lock.lost>15){ ctx.fillStyle='rgba(255,255,255,.8)'; ctx.font=`${H*0.03}px system-ui`; ctx.fillText('👀 where did you go?', vx, top - H*0.02); }
+}
+</script>
+</body>
+</html>
