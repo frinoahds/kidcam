@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
-<title>KidCam</title><!-- v3.0 puppet -->
+<title>KidCam</title><!-- v3.1 puppet -->
 <style>
   html,body{margin:0;height:100%;background:#eef3f8;color:#1a2330;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;overflow:hidden}
   #stage{position:fixed;inset:0;width:100%;height:100%;display:block;touch-action:none}
@@ -38,6 +38,7 @@
     <option value="snow" selected>Snow</option><option value="road">Road</option>
     <option value="sky">Sky</option><option value="space">Space</option><option value="plain">Plain</option>
   </select></label>
+  <button id="skel">🦴 Skeleton</button>
   <button id="reset">Re-centre</button>
   <button id="fs">Fullscreen</button>
   <button id="hide">Hide</button>
@@ -66,7 +67,7 @@ const C = () => CHARS[charName];
 
 // ---------- state ----------
 let landmarker=null, camOn=false, running=false;
-let lm=null, lastSeen=0, faceOn=true, scene='snow';
+let lm=null, lastSeen=0, faceOn=true, scene='snow', debug=false;
 let view={z:1, px:0, py:0};
 let fit={s:1,ox:0,oy:0};
 let lastTs=0;
@@ -79,6 +80,7 @@ Object.entries(CHARS).forEach(([k,v],i)=>{ const b=document.createElement('butto
   charWrap.appendChild(b); });
 $('faceBtn').onclick=()=>{ faceOn=!faceOn; $('faceBtn').classList.toggle('on',faceOn); $('faceBtn').textContent=faceOn?'🙂 Face on':'🙂 Face off'; touchBar(); };
 $('scene').onchange=e=>scene=e.target.value;
+$('skel').onclick=()=>{ debug=!debug; $('skel').classList.toggle('on',debug); touchBar(); };
 $('reset').onclick=()=>{ view={z:1,px:0,py:0}; touchBar(); };
 $('fs').onclick=()=>document.documentElement.requestFullscreen?.().catch(()=>{});
 $('hide').onclick=hideBar; $('peek').onclick=showBar;
@@ -214,12 +216,18 @@ function drawPuppet(){
   const sw=dist(Ls,Rs);
   if(!(sw>4) || shoulders.v<0.35) return false;
   const unit=sw;                              // everything scales off shoulder width
-  const armW=unit*0.34*c.build, legW=unit*0.40*c.build, torsoW=unit*1.12*c.build;
+  const tl=Math.max(dist(shoulders,hips), unit*0.5);
+  const armW=unit*0.34*c.build, legW=unit*0.40*c.build;
+  // cap the torso against its own length, or a seated/foreshortened body becomes a giant egg
+  const torsoW=Math.min(unit*1.12, tl*1.15)*c.build;
   const ear1=P(7), ear2=P(8);
   const headC={ x:(ear1.x+ear2.x)/2, y:(ear1.y+ear2.y)/2 };
   const earD=dist(ear1,ear2);
   const R=Math.max(unit*0.40, earD*0.80)*c.build;
-  const angle=Math.atan2(ear2.y-ear1.y, ear2.x-ear1.x);
+  // Head roll comes from the TORSO (shoulders → head), never from ear ordering.
+  // Which ear index lands on which side flips with mirroring, and getting that
+  // wrong rotates the whole face 180°. shoulders→head is always "up".
+  const angle=Math.atan2(headC.y-shoulders.y, headC.x-shoulders.x)+Math.PI/2;
 
   // auto-frame: whatever the camera distance, the character fills a sane slice of the screen
   const KEY=[0,11,12,13,14,15,16,23,24,25,26,27,28];
@@ -240,8 +248,14 @@ function drawPuppet(){
 
   // legs (behind)
   const Lk=P(25), Rk=P(26), La=P(27), Ra=P(28);
+  const legs=Lk.v>0.3||Rk.v>0.3;
   if(Lk.v>0.3){ limb(Lh,Lk,legW); if(La.v>0.3){ limb(Lk,La,legW*0.85); foot(La,Lk,legW); } }
   if(Rk.v>0.3){ limb(Rh,Rk,legW); if(Ra.v>0.3){ limb(Rk,Ra,legW*0.85); foot(Ra,Rk,legW); } }
+  if(!legs){ // sitting / cut off at the waist — give them a base instead of a floating egg
+    const ux=(hips.x-shoulders.x)/tl, uy=(hips.y-shoulders.y)/tl;
+    limb(Lh,{x:Lh.x+ux*tl*0.45,y:Lh.y+uy*tl*0.45},legW*0.95);
+    limb(Rh,{x:Rh.x+ux*tl*0.45,y:Rh.y+uy*tl*0.45},legW*0.95);
+  }
   // torso
   limb(shoulders,hips,torsoW);
   { const m=mid(shoulders,hips), tl=dist(shoulders,hips);
@@ -314,6 +328,21 @@ function drawScene(W,H){
   ctx.fillText('🌳',W*0.05,H*0.78); ctx.fillText('🏠',W*0.76,H*0.78);
 }
 
+// ---------- skeleton debug view: is the TRACKER wrong, or my drawing? ----------
+const BONES=[[11,12],[11,13],[13,15],[12,14],[14,16],[11,23],[12,24],[23,24],[23,25],[25,27],[24,26],[26,28],[7,8]];
+function drawSkeleton(){
+  ctx.save(); ctx.globalAlpha=0.55; ctx.drawImage(src,fit.ox,fit.oy,src.width*fit.s,src.height*fit.s); ctx.restore();
+  if(!lm) return;
+  ctx.strokeStyle='#ff3ba7'; ctx.lineWidth=4;
+  for(const [a,b] of BONES){ const p=P(a), q=P(b); if(p.v<0.3||q.v<0.3) continue;
+    ctx.beginPath(); ctx.moveTo(p.x,p.y); ctx.lineTo(q.x,q.y); ctx.stroke(); }
+  for(let i=0;i<33;i++){ const p=P(i); if(p.v<0.3) continue;
+    ctx.fillStyle = i===7?'#ffd400' : i===8?'#00d2ff' : '#2bd96b';
+    ctx.beginPath(); ctx.arc(p.x,p.y,i<11?4:7,0,7); ctx.fill(); }
+  const s=mid(P(11),P(12)), h={x:(P(7).x+P(8).x)/2, y:(P(7).y+P(8).y)/2};
+  ctx.strokeStyle='#ff0'; ctx.lineWidth=3; ctx.beginPath(); ctx.moveTo(s.x,s.y); ctx.lineTo(h.x,h.y); ctx.stroke();
+}
+
 // ---------- loop ----------
 function loop(ts){
   requestAnimationFrame(loop);
@@ -331,7 +360,9 @@ function loop(ts){
       lastSeen=ts;
     } else if(ts-lastSeen>900) lm=null;
   }
-  if(lm && drawPuppet()) statusEl.textContent='Drag to move · pinch to size · they move, '+charName+' moves';
+  if(debug) drawSkeleton();
+  if(lm && drawPuppet()) statusEl.textContent= debug ? 'Skeleton view — green dots are what the tracker sees'
+    : 'Drag to move · pinch to size · they move, '+charName+' moves';
   else statusEl.textContent='Step back so your whole body is in frame 🕺';
 }
 requestAnimationFrame(loop);
