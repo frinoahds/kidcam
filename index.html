@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
-<title>KidCam</title><!-- v1.1 -->
+<title>KidCam</title><!-- v1.3 -->
 <style>
   html,body{margin:0;height:100%;background:#eef3f8;color:#1a2330;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;overflow:hidden}
   #stage{position:fixed;inset:0;width:100%;height:100%;display:block;touch-action:none;background:#eef3f8}
@@ -20,13 +20,36 @@
   #peek{position:fixed;right:10px;bottom:10px;width:40px;height:40px;border-radius:50%;background:rgba(255,255,255,.75);border:1px solid #c5ced9;font-size:18px;display:none;z-index:2}
   .sep{width:1px;height:28px;background:#d7dee6}
   label{display:flex;align-items:center;gap:4px}
+  #pip{position:fixed;top:10px;right:10px;width:160px;height:120px;border:2px solid #fff;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,.3);background:#000;display:none;z-index:2}
+  #help{position:fixed;inset:0;background:rgba(238,243,248,.96);display:flex;align-items:center;justify-content:center;padding:20px;z-index:5}
+  #help .card{max-width:520px;background:#fff;border:1px solid #d7dee6;border-radius:14px;padding:22px;font-size:16px;line-height:1.5}
+  #help h2{margin:0 0 10px;font-size:22px}
+  #help ol{margin:0 0 14px;padding-left:22px}
+  #help li{margin-bottom:6px}
+  #help .go{font-size:18px;padding:12px 20px;width:100%}
+  #help .err{background:#fff3f0;border:1px solid #f0b5a8;border-radius:10px;padding:12px;margin-bottom:12px;display:none}
 </style>
 </head>
 <body>
 <video id="video" playsinline muted autoplay></video>
 <canvas id="stage"></canvas>
-<div id="status">Loading models…</div>
+<div id="status">Loading…</div>
+<canvas id="pip"></canvas>
 <button id="peek" title="Show controls">⚙</button>
+
+<div id="help">
+  <div class="card">
+    <h2>KidCam — how it works</h2>
+    <div class="err" id="err"></div>
+    <ol>
+      <li><b>Point the camera at the kids.</b> They get cut out of the room and dropped onto a cartoon scene (road / sky / space). The small box top-right shows the raw camera with a dashed box on every face it finds.</li>
+      <li><b>Tap a kid's face on the big screen</b> → he's in the vehicle you picked. His head keeps moving inside it as he moves. Moving kid? Hit <b>📸 Snap</b> to freeze first, then tap.</li>
+      <li><b>Drag the vehicle</b> around with a finger. <b>Fling it off the edge</b> (or double-tap it) → he's out, full body again.</li>
+    </ol>
+    <p style="margin:0 0 14px;color:#4a5563">Needs: face visible to the camera to lock on. Turning away = tracking pauses (says "where did you go?") and resumes when he looks back.</p>
+    <button id="go" class="primary go" disabled>Loading models… (a few seconds)</button>
+  </div>
+</div>
 
 <div id="bar">
   <button id="start" class="primary">Start camera</button>
@@ -67,6 +90,7 @@ let vx = null, vy = null; // smoothed vehicle position (canvas px)
 let faces = [];           // last detections in video px
 let fit = {s:1, ox:0, oy:0};
 let segmenter, detector, running = false, lastTs = -1;
+let maskCoverage = 0;     // fraction of frame the cutout covers (0 = nobody / broken mask)
 let frozen = false;       // Snap: hold the frame so a face can be tapped
 let drag = null;          // {dx,dy} finger offset while dragging the vehicle
 let held = null;          // {x,y} vehicle parked here after a drag (null = follow face)
@@ -91,27 +115,44 @@ function showBar(){ $('bar').classList.remove('hidden'); $('peek').style.display
 function touchBar(){ clearTimeout(barTimer); if(running) barTimer=setTimeout(hideBar, 6000); }
 $('bar').addEventListener('pointerdown', touchBar);
 
-$('start').onclick = async () => {
+const pip = $('pip'), pctx = pip.getContext('2d');
+const tint = document.createElement('canvas'), tctx = tint.getContext('2d');
+function camError(e){
+  const secure = window.isSecureContext;
+  let why;
+  if(!secure) why = `This page is not on HTTPS (address starts with "${location.protocol}//"), so the browser refuses the camera. Open <b>https://frinoahds.github.io/kidcam/</b> instead.`;
+  else if(/denied|permission/i.test(e.message||e.name)) why = `Camera is <b>blocked for this site</b>. Fix: tap the icon left of the address → Permissions → Camera → Allow → reload. Still blocked? Chrome ⋮ → Settings → Site settings → Camera → this site → Allow. And Android Settings → Apps → Chrome → Permissions → Camera must be on.`;
+  else if(/notfound|devices/i.test(e.name)) why = `No camera found on this device.`;
+  else why = `Camera error: ${e.name} — ${e.message}`;
+  const err = $('err'); err.innerHTML = why; err.style.display='block';
+  $('help').style.display='flex'; $('go').textContent='Try again';
+  statusEl.textContent = 'Camera: failed';
+}
+async function startCam(){
   try {
     const stream = await navigator.mediaDevices.getUserMedia({ video:{ width:{ideal:640}, height:{ideal:480}, facingMode:'user' }, audio:false });
     video.srcObject = stream; await video.play();
     cut.width = maskC.width = video.videoWidth; cut.height = maskC.height = video.videoHeight;
-    running = true; $('start').textContent='Camera on'; $('start').disabled=true; touchBar();
+    pip.width = 320; pip.height = Math.round(320*video.videoHeight/video.videoWidth); pip.style.display='block';
+    running = true; $('start').textContent='Camera on'; $('start').disabled=true; $('help').style.display='none'; touchBar();
     requestAnimationFrame(loop);
-  } catch(e){ statusEl.textContent = 'Camera error: ' + e.message; }
-};
+  } catch(e){ camError(e); }
+}
+$('start').onclick = startCam;
+$('go').onclick = startCam;
 
 // ---------- models ----------
 (async () => {
   try {
     const vision = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
     segmenter = await ImageSegmenter.createFromOptions(vision, {
-      baseOptions:{ modelAssetPath:"https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter/float16/latest/selfie_segmenter.tflite", delegate:"GPU" },
+      baseOptions:{ modelAssetPath:"https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter/float16/latest/selfie_segmenter.tflite", delegate:"CPU" },
       runningMode:"VIDEO", outputCategoryMask:false, outputConfidenceMasks:true });
     detector = await FaceDetector.createFromOptions(vision, {
       baseOptions:{ modelAssetPath:"https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/1/blaze_face_short_range.tflite", delegate:"GPU" },
       runningMode:"VIDEO", minDetectionConfidence:0.5 });
-    statusEl.textContent = 'Ready — press Start camera';
+    statusEl.textContent = 'Models ready';
+    $('go').disabled = false; $('go').textContent = 'Start camera';
     window.__ready = true;
   } catch(e){ statusEl.textContent = 'Model load failed: ' + e.message; console.error(e); }
 })();
@@ -163,13 +204,18 @@ function loop(){
     segmenter.segmentForVideo(video, ts, res => {
       const masks = res.confidenceMasks; const m = masks[masks.length-1];
       const data = m.getAsFloat32Array(), w=m.width, h=m.height;
-      if(!autoInvertChecked && faces.length){ // sample: person region vs corners
-        const f=faces[0]; const sx=(f.x+f.w/2)/cut.width*w|0, sy=(f.y+f.h/2)/cut.height*h|0;
-        const face=data[sy*w+sx], corner=(data[0]+data[w-1])/2;
-        invert = face < corner; $('invert').classList.toggle('on',invert); autoInvertChecked=true;
+      if(!autoInvertChecked && faces.length){ // average inside the face box vs the top corners
+        const f=faces[0]; let fs=0,fn=0,cs=0,cn=0;
+        const x0=(f.x/cut.width*w)|0, x1=((f.x+f.w)/cut.width*w)|0, y0=(f.y/cut.height*h)|0, y1=((f.y+f.h)/cut.height*h)|0;
+        for(let y=y0;y<y1;y+=2) for(let x=x0;x<x1;x+=2){ fs+=data[y*w+x]; fn++; }
+        const cw=w*0.08|0, ch=h*0.08|0;
+        for(let y=0;y<ch;y++) for(let x=0;x<cw;x++){ cs+=data[y*w+x]+data[y*w+(w-1-x)]; cn+=2; }
+        const face=fs/(fn||1), corner=cs/(cn||1);
+        if(Math.abs(face-corner) > 0.2){ invert = face < corner; $('invert').classList.toggle('on',invert); autoInvertChecked=true; }
       }
-      const img = mctx.createImageData(w,h); const a=img.data;
-      for(let i=0,j=3;i<data.length;i++,j+=4){ const v=invert?1-data[i]:data[i]; a[j] = v>0.35 ? Math.min(255, (v-0.35)*600|0) : 0; }
+      const img = mctx.createImageData(w,h); const a=img.data; let on=0;
+      for(let i=0,j=3;i<data.length;i++,j+=4){ const v=invert?1-data[i]:data[i]; if(v>0.35){ a[j]=Math.min(255,(v-0.35)*600|0); on++; } }
+      maskCoverage = on/data.length;
       if(maskC.width!==w||maskC.height!==h){ maskC.width=w; maskC.height=h; }
       mctx.putImageData(img,0,0);
       cctx.globalCompositeOperation='source-over'; cctx.drawImage(video,0,0,cut.width,cut.height);
@@ -202,8 +248,27 @@ function drawScene(W,H){
     ctx.font=`${H*0.12}px serif`; ctx.fillText('🌳', W*0.05, H*0.78); ctx.fillText('🏠', W*0.75, H*0.78); ctx.fillText('🌞', W*0.85, H*0.15); }
 }
 
+function drawPip(){
+  const pw=pip.width, ph=pip.height, sx=pw/cut.width, sy=ph/cut.height;
+  pctx.drawImage(video,0,0,pw,ph);
+  // green tint = what the cutout thinks is a person
+  if(tint.width!==pw||tint.height!==ph){ tint.width=pw; tint.height=ph; }
+  tctx.globalCompositeOperation='source-over'; tctx.clearRect(0,0,pw,ph); tctx.drawImage(cut,0,0,pw,ph);
+  tctx.globalCompositeOperation='source-atop'; tctx.fillStyle='#22c55e'; tctx.fillRect(0,0,pw,ph);
+  pctx.save(); pctx.globalAlpha=0.5; pctx.drawImage(tint,0,0); pctx.restore();
+  pctx.fillStyle='rgba(0,0,0,.6)'; pctx.fillRect(0,ph-16,pw,16); pctx.fillStyle='#fff'; pctx.font='12px system-ui';
+  pctx.fillText(`cutout ${Math.round(maskCoverage*100)}%  faces ${faces.length}`, 4, ph-4);
+  pctx.lineWidth=2; pctx.strokeStyle='#ffd400';
+  for(const f of faces) pctx.strokeRect(f.x*sx,f.y*sy,f.w*sx,f.h*sy);
+  if(lock){ pctx.strokeStyle='#22c55e'; pctx.lineWidth=3; pctx.strokeRect((lock.cx-lock.w/2)*sx,(lock.cy-lock.h/2)*sy,lock.w*sx,lock.h*sy); }
+}
 function draw(ts){
   const W=stage.width, H=stage.height; computeFit();
+  drawPip();
+  statusEl.textContent = (faces.length && maskCoverage < 0.01) ? '⚠️ Face found but cutout is empty — tap Invert mask' :
+    frozen ? '📸 Frozen — tap a face' :
+    lock ? (lock.lost>15 ? '🟠 Locked — lost him, waiting for face' : '🟢 Locked in ' + vehicle.e + ' — drag it, fling off edge to release')
+         : (faces.length ? `👀 ${faces.length} face${faces.length>1?'s':''} found — tap one` : '🔍 Looking for a face… face the camera');
   drawScene(W,H);
   if(!lock){
     ctx.drawImage(cut, fit.ox, fit.oy, cut.width*fit.s, cut.height*fit.s);
