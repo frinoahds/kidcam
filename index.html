@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
-<title>KidCam</title>
+<title>KidCam</title><!-- v1.1 -->
 <style>
   html,body{margin:0;height:100%;background:#eef3f8;color:#1a2330;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;overflow:hidden}
   #stage{position:fixed;inset:0;width:100%;height:100%;display:block;touch-action:none;background:#eef3f8}
@@ -39,6 +39,7 @@
   </select></label>
   <label>Size <input id="vsize" type="range" min="0.25" max="0.7" step="0.01" value="0.45"></label>
   <button id="invert">Invert mask</button>
+  <button id="snap">📸 Snap</button>
   <button id="release">Release</button>
   <button id="fs">Fullscreen</button>
   <button id="hide">Hide</button>
@@ -66,6 +67,9 @@ let vx = null, vy = null; // smoothed vehicle position (canvas px)
 let faces = [];           // last detections in video px
 let fit = {s:1, ox:0, oy:0};
 let segmenter, detector, running = false, lastTs = -1;
+let frozen = false;       // Snap: hold the frame so a face can be tapped
+let drag = null;          // {dx,dy} finger offset while dragging the vehicle
+let held = null;          // {x,y} vehicle parked here after a drag (null = follow face)
 
 // ---------- UI ----------
 const vehWrap = $('vehicles');
@@ -75,7 +79,9 @@ $('crop').onchange = e => cropK = +e.target.value;
 $('scene').onchange = e => scene = e.target.value;
 $('vsize').oninput = e => vsizeF = +e.target.value;
 $('invert').onclick = () => { invert=!invert; $('invert').classList.toggle('on',invert); autoInvertChecked=true; touchBar(); };
-$('release').onclick = () => { lock=null; vx=vy=null; touchBar(); };
+function release(){ lock=null; vx=vy=null; held=null; drag=null; }
+$('release').onclick = () => { release(); touchBar(); };
+$('snap').onclick = () => { if(!running) return; frozen=!frozen; $('snap').classList.toggle('on',frozen); touchBar(); };
 $('fs').onclick = () => document.documentElement.requestFullscreen?.().catch(()=>{});
 $('hide').onclick = () => hideBar();
 $('peek').onclick = () => showBar();
@@ -119,24 +125,40 @@ function computeFit(){
 }
 const toCanvas = (x,y) => [fit.ox + x*fit.s, fit.oy + y*fit.s];
 
-// tap: lock onto a face, or double-tap vehicle to release
+// tap a face → lock. Drag the vehicle → move it; drag it off any edge → release. Double-tap vehicle → release.
 let lastTap = 0;
+const onVehicle = (px,py) => lock && vx!=null && Math.abs(px-vx) < stage.height*vsizeF*0.6 && Math.abs(py-vy) < stage.height*vsizeF*0.6;
 stage.addEventListener('pointerdown', ev => {
   if(!running) { showBar(); return; }
   const px = ev.clientX*devicePixelRatio, py = ev.clientY*devicePixelRatio;
   const now = performance.now();
-  if(lock && vx!=null){ const vs = stage.height*vsizeF; if(Math.abs(px-vx)<vs*0.6 && Math.abs(py-vy)<vs*0.6 && now-lastTap<400){ lock=null; vx=vy=null; } lastTap=now; }
+  if(onVehicle(px,py)){
+    if(now-lastTap<400){ release(); lastTap=0; return; }
+    lastTap=now; drag={dx:vx-px, dy:vy-py}; stage.setPointerCapture(ev.pointerId); return;
+  }
   const x = (px - fit.ox)/fit.s, y = (py - fit.oy)/fit.s;
   const hit = faces.find(f => x>=f.x-f.w*0.3 && x<=f.x+f.w*1.3 && y>=f.y-f.h*0.3 && y<=f.y+f.h*1.3);
-  if(hit){ lock = {cx:hit.x+hit.w/2, cy:hit.y+hit.h/2, w:hit.w, h:hit.h, lost:0}; vx=vy=null; }
+  if(hit){ lock = {cx:hit.x+hit.w/2, cy:hit.y+hit.h/2, w:hit.w, h:hit.h, lost:0}; vx=vy=null; held=null;
+           if(frozen){ frozen=false; $('snap').classList.remove('on'); } }
   else showBar();
 });
+stage.addEventListener('pointermove', ev => {
+  if(!drag) return;
+  vx = ev.clientX*devicePixelRatio + drag.dx; vy = ev.clientY*devicePixelRatio + drag.dy;
+});
+stage.addEventListener('pointerup', ev => {
+  if(!drag) return; drag=null;
+  const W=stage.width, H=stage.height, m=stage.height*vsizeF*0.25;
+  if(vx < m || vx > W-m || vy < m || vy > H-m) release();   // flung off the edge
+  else held = {x:vx, y:vy};
+});
+stage.addEventListener('pointercancel', () => { drag=null; });
 
 // ---------- per-frame ----------
 function loop(){
   if(!running) return;
   const ts = performance.now();
-  if(video.readyState >= 2 && ts !== lastTs){
+  if(!frozen && video.readyState >= 2 && ts !== lastTs){
     lastTs = ts;
     segmenter.segmentForVideo(video, ts, res => {
       const masks = res.confidenceMasks; const m = masks[masks.length-1];
@@ -188,6 +210,7 @@ function draw(ts){
     ctx.strokeStyle='rgba(31,111,235,.9)'; ctx.lineWidth=4; ctx.setLineDash([12,8]);
     for(const f of faces){ const [x,y]=toCanvas(f.x,f.y); ctx.strokeRect(x,y,f.w*fit.s,f.h*fit.s); }
     ctx.setLineDash([]);
+    if(frozen){ ctx.fillStyle='rgba(255,255,255,.85)'; ctx.font=`${H*0.035}px system-ui`; ctx.textAlign='center'; ctx.fillText('📸 frozen — tap a face', W/2, H*0.08); }
     return;
   }
   // vehicle position follows the locked face (smoothed)
@@ -195,7 +218,9 @@ function draw(ts){
   const [fx] = toCanvas(lock.cx, lock.cy);
   const targetX = Math.max(vs*0.5, Math.min(W-vs*0.5, fx));
   const targetY = (scene==='road' ? H*0.80 : H*0.55) + Math.sin(ts/500)*H*0.01;
-  if(vx==null){ vx=targetX; vy=targetY; } else { vx+=(targetX-vx)*0.08; vy+=(targetY-vy)*0.08; }
+  if(drag){ /* finger owns position */ }
+  else if(held){ vx=held.x; vy=held.y + Math.sin(ts/500)*H*0.01; }
+  else if(vx==null){ vx=targetX; vy=targetY; } else { vx+=(targetX-vx)*0.08; vy+=(targetY-vy)*0.08; }
   const left = vx - vs/2, top = vy - vs/2;
   ctx.font = `${vs*0.9}px "Apple Color Emoji","Segoe UI Emoji","Noto Color Emoji",serif`;
   ctx.textAlign='center'; ctx.textBaseline='middle';
